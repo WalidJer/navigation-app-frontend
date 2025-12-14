@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { navigationApi } from "../api/navigationApi";
 import { formatDateTime } from "../utils/format";
+import RouteMap from "../components/RouteMap";
 
 function normalizeAddresses(payload) {
   if (Array.isArray(payload)) return payload;
@@ -9,25 +10,75 @@ function normalizeAddresses(payload) {
 }
 
 function formatKm(km) {
-  if (km == null) return "";
+  if (km == null || Number.isNaN(km)) return "";
   return `${km.toFixed(2)} km`;
 }
 
 function formatMin(min) {
-  if (min == null) return "";
+  if (min == null || Number.isNaN(min)) return "";
   return `${min.toFixed(1)} min`;
 }
 
+function isValidCoord(n) {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+function getCurrentLocation() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("Geolocation is not supported in this browser."));
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        resolve({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+        });
+      },
+      (err) => {
+        reject(
+          new Error(
+            err?.message ||
+              "Failed to get your location. Please allow location permission."
+          )
+        );
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+
 export default function Navigate() {
+  // Form
   const [address, setAddress] = useState("");
-  const [speedMps, setSpeedMps] = useState(4); 
+  const [speedMps, setSpeedMps] = useState(4);
+
+  // History
   const [history, setHistory] = useState([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [historyError, setHistoryError] = useState("");
 
+  // Navigation
   const [submitting, setSubmitting] = useState(false);
   const [navError, setNavError] = useState("");
   const [navResult, setNavResult] = useState(null);
+
+  // Map state
+  const [activeFrom, setActiveFrom] = useState(null);
+  const [activeTo, setActiveTo] = useState(null);
+  const [routeCoords, setRouteCoords] = useState([]);
+
+  // Refs for live updates
+  const watchIdRef = useRef(null);
+  const lastMetricsAtRef = useRef(0);
+  const activeToRef = useRef(null);
+  const speedRef = useRef(speedMps);
+
+  useEffect(() => {
+    speedRef.current = speedMps;
+  }, [speedMps]);
 
   async function loadHistory() {
     setLoadingHistory(true);
@@ -36,7 +87,7 @@ export default function Navigate() {
       const data = await navigationApi.getAddresses();
       setHistory(normalizeAddresses(data));
     } catch (e) {
-      setHistoryError(e.message || "Failed to load address history.");
+      setHistoryError(e?.message || "Failed to load address history.");
     } finally {
       setLoadingHistory(false);
     }
@@ -44,41 +95,69 @@ export default function Navigate() {
 
   useEffect(() => {
     loadHistory();
+    return () => {
+      // cleanup watch when leaving page
+      if (watchIdRef.current != null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
   }, []);
 
-  const canNavigate = useMemo(() => address.trim().length > 0 && !submitting, [
-    address,
-    submitting,
-  ]);
+  const canNavigate = useMemo(
+    () => address.trim().length > 0 && !submitting,
+    [address, submitting]
+  );
 
-  function isValidCoord(n) {
-    return typeof n === "number" && Number.isFinite(n);
-  }
+  async function startWatchPosition() {
+    if (!navigator.geolocation) return;
 
-  function getCurrentLocation() {
-    return new Promise((resolve, reject) => {
-      if (!navigator.geolocation) {
-        reject(new Error("Geolocation is not supported in this browser."));
-        return;
-      }
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          resolve({
-            lat: pos.coords.latitude,
-            lng: pos.coords.longitude,
+    // clear existing watch if any
+    if (watchIdRef.current != null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      async (pos) => {
+        const newFrom = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setActiveFrom(newFrom);
+
+        // throttle metrics calls (every ~2s)
+        const now = Date.now();
+        if (now - lastMetricsAtRef.current < 2000) return;
+        lastMetricsAtRef.current = now;
+
+        const to = activeToRef.current;
+        if (!to) return;
+
+        try {
+          const metrics = await navigationApi.navMetrics({
+            from: newFrom,
+            to,
+            speedMps: Number(speedRef.current),
           });
-        },
-        (err) => {
-          reject(
-            new Error(
-              err?.message ||
-                "Failed to get your location. Please allow location permission."
-            )
+
+          // Update ONLY live metrics, keep the rest (destination + route)
+          setNavResult((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  live: {
+                    remainingMeters: metrics.remainingMeters,
+                    remainingKm: metrics.remainingKm,
+                    etaSeconds: metrics.etaSeconds,
+                    etaMinutes: metrics.etaMinutes,
+                  },
+                }
+              : prev
           );
-        },
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
-    });
+        } catch {
+          // ignore metrics errors while moving
+        }
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 1000 }
+    );
   }
 
   async function onSubmit(e) {
@@ -90,7 +169,9 @@ export default function Navigate() {
     if (!trimmed) return;
 
     setSubmitting(true);
+
     try {
+      // Get current location for "from"
       const from = await getCurrentLocation();
       if (!from || !isValidCoord(from.lat) || !isValidCoord(from.lng)) {
         throw new Error("Invalid current location.");
@@ -105,10 +186,25 @@ export default function Navigate() {
       const result = await navigationApi.navigate(payload);
       setNavResult(result);
 
-      // refresh history list so the new address appears
+      // destination coords for map + metrics
+      const dest = result.destination;
+      const to = { lat: Number(dest.latitude), lng: Number(dest.longitude) };
+
+      setActiveFrom(from);
+      setActiveTo(to);
+      activeToRef.current = to;
+
+      // Convert GeoJSON [lng,lat] -> Leaflet [lat,lng]
+      const coords = result.route?.geometry?.coordinates || [];
+      setRouteCoords(coords.map(([lng, lat]) => [lat, lng]));
+
+      // Start live tracking updates
+      await startWatchPosition();
+
+      // Refresh history list so the new address appears
       await loadHistory();
-    } catch (e2) {
-      setNavError(e2.message || "Navigate request failed.");
+    } catch (err) {
+      setNavError(err?.message || "Navigate request failed.");
     } finally {
       setSubmitting(false);
     }
@@ -119,14 +215,22 @@ export default function Navigate() {
       <h3>Destination Entry</h3>
       <p>Enter a destination address and start navigation.</p>
 
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, margin: "16px 0" }}>
+      <form
+        onSubmit={onSubmit}
+        style={{ display: "grid", gap: 10, margin: "16px 0" }}
+      >
         <div style={{ display: "flex", gap: 8 }}>
           <input
             type="text"
             value={address}
             onChange={(e) => setAddress(e.target.value)}
             placeholder='e.g., "123 Main St, St. John’s, NL"'
-            style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ccc" }}
+            style={{
+              flex: 1,
+              padding: 10,
+              borderRadius: 8,
+              border: "1px solid #ccc",
+            }}
           />
           <button
             type="submit"
@@ -146,16 +250,19 @@ export default function Navigate() {
         </div>
 
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <label style={{ fontSize: 14, opacity: 0.9 }}>
-            Speed (m/s):
-          </label>
+          <label style={{ fontSize: 14, opacity: 0.9 }}>Speed (m/s):</label>
           <input
             type="number"
             step="0.1"
             min="0.5"
             value={speedMps}
             onChange={(e) => setSpeedMps(e.target.value)}
-            style={{ width: 120, padding: 8, borderRadius: 8, border: "1px solid #ccc" }}
+            style={{
+              width: 120,
+              padding: 8,
+              borderRadius: 8,
+              border: "1px solid #ccc",
+            }}
           />
           <span style={{ fontSize: 12, opacity: 0.7 }}>
             (4 m/s ≈ fast walk / light jog)
@@ -164,24 +271,31 @@ export default function Navigate() {
       </form>
 
       {navError && (
-        <p style={{ marginTop: 10, color: "crimson" }}>
-          Error: {navError}
-        </p>
+        <p style={{ marginTop: 10, color: "crimson" }}>Error: {navError}</p>
       )}
 
       {navResult && (
-        <div style={{ marginTop: 14, padding: 14, border: "1px solid #eee", borderRadius: 10 }}>
+        <div
+          style={{
+            marginTop: 14,
+            padding: 14,
+            border: "1px solid #eee",
+            borderRadius: 10,
+          }}
+        >
           <h4 style={{ marginTop: 0 }}>Navigation Summary</h4>
 
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontWeight: 700 }}>
               Destination: {navResult.destination?.address}
             </div>
+
             {navResult.destination?.displayName && (
               <div style={{ fontSize: 12, opacity: 0.8 }}>
                 {navResult.destination.displayName}
               </div>
             )}
+
             <div style={{ fontSize: 12, opacity: 0.75 }}>
               Cached: {navResult.destination?.cached ? "true" : "false"}
             </div>
@@ -207,10 +321,29 @@ export default function Navigate() {
                 : "N/A"}
             </div>
           </div>
+
+          {/*  Step 4 Map */}
+          {activeFrom && activeTo && (
+            <div style={{ marginTop: 14 }}>
+              <h4 style={{ marginBottom: 8 }}>Map</h4>
+              <RouteMap
+                from={activeFrom}
+                to={activeTo}
+                routeCoords={routeCoords}
+              />
+            </div>
+          )}
         </div>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          marginTop: 18,
+        }}
+      >
         <h4 style={{ margin: 0 }}>Address History</h4>
         <button
           onClick={loadHistory}
@@ -227,9 +360,7 @@ export default function Navigate() {
 
       {loadingHistory && <p style={{ marginTop: 10 }}>Loading history…</p>}
       {historyError && (
-        <p style={{ marginTop: 10, color: "crimson" }}>
-          Error: {historyError}
-        </p>
+        <p style={{ marginTop: 10, color: "crimson" }}>Error: {historyError}</p>
       )}
 
       {!loadingHistory && !historyError && history.length === 0 && (

@@ -11,4 +11,10 @@ export const navigationApi = {
     method: "POST",
     body: JSON.stringify(payload),
   }),
+
+  navMetrics: (payload) =>
+  http("/api/nav/metrics", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }),
 };
