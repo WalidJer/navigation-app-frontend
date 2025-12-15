@@ -10,12 +10,12 @@ function normalizeAddresses(payload) {
 }
 
 function formatKm(km) {
-  if (km == null || Number.isNaN(km)) return "";
+  if (km == null) return "";
   return `${km.toFixed(2)} km`;
 }
 
 function formatMin(min) {
-  if (min == null || Number.isNaN(min)) return "";
+  if (min == null) return "";
   return `${min.toFixed(1)} min`;
 }
 
@@ -23,62 +23,47 @@ function isValidCoord(n) {
   return typeof n === "number" && Number.isFinite(n);
 }
 
-function getCurrentLocation() {
-  return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) {
-      reject(new Error("Geolocation is not supported in this browser."));
-      return;
-    }
+// small haversine helper (meters)
+function haversineMeters(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        resolve({
-          lat: pos.coords.latitude,
-          lng: pos.coords.longitude,
-        });
-      },
-      (err) => {
-        reject(
-          new Error(
-            err?.message ||
-              "Failed to get your location. Please allow location permission."
-          )
-        );
-      },
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
-  });
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const x =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLng / 2) * Math.sin(dLng / 2) * Math.cos(lat1) * Math.cos(lat2);
+
+  const c = 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+  return R * c;
 }
 
 export default function Navigate() {
-  // Form
   const [address, setAddress] = useState("");
   const [speedMps, setSpeedMps] = useState(4);
 
-  // History
   const [history, setHistory] = useState([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [historyError, setHistoryError] = useState("");
 
-  // Navigation
   const [submitting, setSubmitting] = useState(false);
   const [navError, setNavError] = useState("");
   const [navResult, setNavResult] = useState(null);
 
-  // Map state
   const [activeFrom, setActiveFrom] = useState(null);
   const [activeTo, setActiveTo] = useState(null);
   const [routeCoords, setRouteCoords] = useState([]);
 
-  // Refs for live updates
   const watchIdRef = useRef(null);
   const lastMetricsAtRef = useRef(0);
-  const activeToRef = useRef(null);
-  const speedRef = useRef(speedMps);
 
-  useEffect(() => {
-    speedRef.current = speedMps;
-  }, [speedMps]);
+  // reroute controls
+  const lastRerouteAtRef = useRef(0);
+  const lastRerouteFromRef = useRef(null);
 
   async function loadHistory() {
     setLoadingHistory(true);
@@ -87,7 +72,7 @@ export default function Navigate() {
       const data = await navigationApi.getAddresses();
       setHistory(normalizeAddresses(data));
     } catch (e) {
-      setHistoryError(e?.message || "Failed to load address history.");
+      setHistoryError(e.message || "Failed to load address history.");
     } finally {
       setLoadingHistory(false);
     }
@@ -95,10 +80,14 @@ export default function Navigate() {
 
   useEffect(() => {
     loadHistory();
+  }, []);
+
+  // cleanup on unmount
+  useEffect(() => {
     return () => {
-      // cleanup watch when leaving page
       if (watchIdRef.current != null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
       }
     };
   }, []);
@@ -108,56 +97,74 @@ export default function Navigate() {
     [address, submitting]
   );
 
-  async function startWatchPosition() {
-    if (!navigator.geolocation) return;
+  function getCurrentLocation() {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error("Geolocation is not supported in this browser."));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          resolve({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+          });
+        },
+        (err) => {
+          reject(
+            new Error(
+              err?.message ||
+                "Failed to get your location. Please allow location permission."
+            )
+          );
+        },
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
+    });
+  }
 
-    // clear existing watch if any
+  function stopNavigation() {
     if (watchIdRef.current != null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+    lastMetricsAtRef.current = 0;
+    lastRerouteAtRef.current = 0;
+    lastRerouteFromRef.current = null;
 
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      async (pos) => {
-        const newFrom = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        setActiveFrom(newFrom);
+    setNavError("");
+    setNavResult(null);
+    setActiveFrom(null);
+    setActiveTo(null);
+    setRouteCoords([]);
+  }
 
-        // throttle metrics calls (every ~2s)
-        const now = Date.now();
-        if (now - lastMetricsAtRef.current < 2000) return;
-        lastMetricsAtRef.current = now;
+  function setRouteFromGeoJson(routeGeometry) {
+    const coords = routeGeometry?.coordinates || [];
+    // GeoJSON: [lng,lat] -> Leaflet: [lat,lng]
+    setRouteCoords(coords.map(([lng, lat]) => [lat, lng]));
+  }
 
-        const to = activeToRef.current;
-        if (!to) return;
+  async function rerouteNow(from, to) {
+    // call /api/route to refresh geometry + distance/duration
+    const route = await navigationApi.route({ from, to });
 
-        try {
-          const metrics = await navigationApi.navMetrics({
-            from: newFrom,
-            to,
-            speedMps: Number(speedRef.current),
-          });
-
-          // Update ONLY live metrics, keep the rest (destination + route)
-          setNavResult((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  live: {
-                    remainingMeters: metrics.remainingMeters,
-                    remainingKm: metrics.remainingKm,
-                    etaSeconds: metrics.etaSeconds,
-                    etaMinutes: metrics.etaMinutes,
-                  },
-                }
-              : prev
-          );
-        } catch {
-          // ignore metrics errors while moving
-        }
-      },
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 1000 }
+    setNavResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            route: {
+              distanceMeters: route.distanceMeters,
+              durationSeconds: route.durationSeconds,
+              distanceKm: route.distanceKm,
+              durationMin: route.durationMin,
+              geometry: route.geometry,
+            },
+          }
+        : prev
     );
+
+    setRouteFromGeoJson(route.geometry);
   }
 
   async function onSubmit(e) {
@@ -169,9 +176,7 @@ export default function Navigate() {
     if (!trimmed) return;
 
     setSubmitting(true);
-
     try {
-      // Get current location for "from"
       const from = await getCurrentLocation();
       if (!from || !isValidCoord(from.lat) || !isValidCoord(from.lng)) {
         throw new Error("Invalid current location.");
@@ -184,54 +189,113 @@ export default function Navigate() {
       };
 
       const result = await navigationApi.navigate(payload);
+
       setNavResult(result);
 
-      // destination coords for map + metrics
       const dest = result.destination;
-      const to = { lat: Number(dest.latitude), lng: Number(dest.longitude) };
+      const to = { lat: dest.latitude, lng: dest.longitude };
 
       setActiveFrom(from);
       setActiveTo(to);
-      activeToRef.current = to;
 
-      // Convert GeoJSON [lng,lat] -> Leaflet [lat,lng]
-      const coords = result.route?.geometry?.coordinates || [];
-      setRouteCoords(coords.map(([lng, lat]) => [lat, lng]));
+      setRouteFromGeoJson(result.route?.geometry);
 
-      // Start live tracking updates
-      await startWatchPosition();
+      // reset reroute trackers for this session
+      lastRerouteAtRef.current = Date.now();
+      lastRerouteFromRef.current = from;
 
-      // Refresh history list so the new address appears
+      // stop old watch if exists
+      if (watchIdRef.current != null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        async (pos) => {
+          const newFrom = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setActiveFrom(newFrom);
+
+          // throttle metrics calls (every ~2s)
+          const now = Date.now();
+          if (now - lastMetricsAtRef.current >= 2000) {
+            lastMetricsAtRef.current = now;
+
+            try {
+              const metrics = await navigationApi.navMetrics({
+                from: newFrom,
+                to,
+                speedMps: Number(speedMps),
+              });
+
+              setNavResult((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      live: {
+                        remainingMeters: metrics.remainingMeters,
+                        remainingKm: metrics.remainingKm,
+                        etaSeconds: metrics.etaSeconds,
+                        etaMinutes: metrics.etaMinutes,
+                      },
+                    }
+                  : prev
+              );
+            } catch {
+              // ignore metrics errors during movement
+            }
+          }
+
+          // auto reroute when moved enough + time passed
+          const lastFrom = lastRerouteFromRef.current;
+          const moved =
+            lastFrom && isValidCoord(lastFrom.lat) && isValidCoord(lastFrom.lng)
+              ? haversineMeters(lastFrom, newFrom)
+              : 0;
+
+          const timeSince = now - lastRerouteAtRef.current;
+
+          // tweak these thresholds if you want
+          const MOVED_THRESHOLD_METERS = 30; // reroute if moved 30m+
+          const MIN_REROUTE_INTERVAL_MS = 10000; // at most every 10s
+
+          if (moved >= MOVED_THRESHOLD_METERS && timeSince >= MIN_REROUTE_INTERVAL_MS) {
+            try {
+              await rerouteNow(newFrom, to);
+              lastRerouteAtRef.current = now;
+              lastRerouteFromRef.current = newFrom;
+            } catch {
+              // ignore reroute errors
+            }
+          }
+        },
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 1000 }
+      );
+
       await loadHistory();
-    } catch (err) {
-      setNavError(err?.message || "Navigate request failed.");
+    } catch (e2) {
+      setNavError(e2.message || "Navigate request failed.");
     } finally {
       setSubmitting(false);
     }
   }
+
+  const navActive = !!(activeFrom && activeTo && navResult);
 
   return (
     <div>
       <h3>Destination Entry</h3>
       <p>Enter a destination address and start navigation.</p>
 
-      <form
-        onSubmit={onSubmit}
-        style={{ display: "grid", gap: 10, margin: "16px 0" }}
-      >
+      <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, margin: "16px 0" }}>
         <div style={{ display: "flex", gap: 8 }}>
           <input
             type="text"
             value={address}
             onChange={(e) => setAddress(e.target.value)}
             placeholder='e.g., "123 Main St, St. John’s, NL"'
-            style={{
-              flex: 1,
-              padding: 10,
-              borderRadius: 8,
-              border: "1px solid #ccc",
-            }}
+            style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ccc" }}
           />
+
           <button
             type="submit"
             disabled={!canNavigate}
@@ -247,9 +311,25 @@ export default function Navigate() {
           >
             {submitting ? "Starting..." : "Navigate To"}
           </button>
+
+          <button
+            type="button"
+            onClick={stopNavigation}
+            disabled={!navActive}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: navActive ? "#fff" : "#f3f3f3",
+              cursor: navActive ? "pointer" : "not-allowed",
+              minWidth: 120,
+            }}
+          >
+            Stop
+          </button>
         </div>
 
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <label style={{ fontSize: 14, opacity: 0.9 }}>Speed (m/s):</label>
           <input
             type="number"
@@ -257,45 +337,43 @@ export default function Navigate() {
             min="0.5"
             value={speedMps}
             onChange={(e) => setSpeedMps(e.target.value)}
+            style={{ width: 120, padding: 8, borderRadius: 8, border: "1px solid #ccc" }}
+          />
+          <span style={{ fontSize: 12, opacity: 0.7 }}>(4 m/s ≈ fast walk / light jog)</span>
+
+          <button
+            type="button"
+            disabled={!navActive}
+            onClick={() => rerouteNow(activeFrom, activeTo)}
             style={{
-              width: 120,
-              padding: 8,
+              marginLeft: "auto",
+              padding: "8px 12px",
               borderRadius: 8,
               border: "1px solid #ccc",
+              background: navActive ? "#fff" : "#f3f3f3",
+              cursor: navActive ? "pointer" : "not-allowed",
             }}
-          />
-          <span style={{ fontSize: 12, opacity: 0.7 }}>
-            (4 m/s ≈ fast walk / light jog)
-          </span>
+          >
+            Re-route now
+          </button>
         </div>
       </form>
 
-      {navError && (
-        <p style={{ marginTop: 10, color: "crimson" }}>Error: {navError}</p>
-      )}
+      {navError && <p style={{ marginTop: 10, color: "crimson" }}>Error: {navError}</p>}
 
       {navResult && (
-        <div
-          style={{
-            marginTop: 14,
-            padding: 14,
-            border: "1px solid #eee",
-            borderRadius: 10,
-          }}
-        >
+        <div style={{ marginTop: 14, padding: 14, border: "1px solid #eee", borderRadius: 10 }}>
           <h4 style={{ marginTop: 0 }}>Navigation Summary</h4>
 
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontWeight: 700 }}>
               Destination: {navResult.destination?.address}
             </div>
-
             {navResult.destination?.displayName && (
               <div style={{ fontSize: 12, opacity: 0.8 }}>
                 {navResult.destination.displayName}
               </div>
             )}
-
             <div style={{ fontSize: 12, opacity: 0.75 }}>
               Cached: {navResult.destination?.cached ? "true" : "false"}
             </div>
@@ -303,47 +381,31 @@ export default function Navigate() {
 
           <div style={{ display: "grid", gap: 6 }}>
             <div>
-              <strong>Route Distance:</strong>{" "}
-              {formatKm(navResult.route?.distanceKm)}
+              <strong>Route Distance:</strong> {formatKm(navResult.route?.distanceKm)}
             </div>
             <div>
-              <strong>Route Duration:</strong>{" "}
-              {formatMin(navResult.route?.durationMin)}
+              <strong>Route Duration:</strong> {formatMin(navResult.route?.durationMin)}
             </div>
             <div>
-              <strong>Remaining:</strong>{" "}
-              {formatKm(navResult.live?.remainingKm)}
+              <strong>Remaining:</strong> {formatKm(navResult.live?.remainingKm)}
             </div>
             <div>
               <strong>ETA:</strong>{" "}
-              {navResult.live?.etaMinutes != null
-                ? formatMin(navResult.live.etaMinutes)
-                : "N/A"}
+              {navResult.live?.etaMinutes != null ? formatMin(navResult.live.etaMinutes) : "N/A"}
             </div>
           </div>
 
-          {/*  Step 4 Map */}
+          {/* ✅ Map */}
           {activeFrom && activeTo && (
             <div style={{ marginTop: 14 }}>
-              <h4 style={{ marginBottom: 8 }}>Map</h4>
-              <RouteMap
-                from={activeFrom}
-                to={activeTo}
-                routeCoords={routeCoords}
-              />
+              <h4 style={{ margin: "10px 0" }}>Map</h4>
+              <RouteMap from={activeFrom} to={activeTo} routeCoords={routeCoords} />
             </div>
           )}
         </div>
       )}
 
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          marginTop: 18,
-        }}
-      >
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18 }}>
         <h4 style={{ margin: 0 }}>Address History</h4>
         <button
           onClick={loadHistory}
@@ -359,14 +421,10 @@ export default function Navigate() {
       </div>
 
       {loadingHistory && <p style={{ marginTop: 10 }}>Loading history…</p>}
-      {historyError && (
-        <p style={{ marginTop: 10, color: "crimson" }}>Error: {historyError}</p>
-      )}
+      {historyError && <p style={{ marginTop: 10, color: "crimson" }}>Error: {historyError}</p>}
 
       {!loadingHistory && !historyError && history.length === 0 && (
-        <p style={{ marginTop: 10 }}>
-          No saved addresses yet. Start navigation to save your first one.
-        </p>
+        <p style={{ marginTop: 10 }}>No saved addresses yet. Start navigation to save your first one.</p>
       )}
 
       {!loadingHistory && !historyError && history.length > 0 && (
@@ -385,12 +443,8 @@ export default function Navigate() {
                 cursor: "pointer",
               }}
             >
-              <div style={{ fontWeight: 600 }}>
-                {item.address || item.address_text}
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>
-                Saved: {formatDateTime(item.created_at)}
-              </div>
+              <div style={{ fontWeight: 600 }}>{item.address || item.address_text}</div>
+              <div style={{ fontSize: 12, opacity: 0.75 }}>Saved: {formatDateTime(item.created_at)}</div>
             </button>
           ))}
         </div>

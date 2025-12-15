@@ -17,4 +17,10 @@ export const navigationApi = {
     method: "POST",
     body: JSON.stringify(payload),
   }),
+
+  route: (payload) =>
+  http("/api/route", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }),
 };
