@@ -324,9 +324,7 @@ export default function Navigate() {
       //
     }
 
-    // optional: reroute sometimes (keeps geometry “fresh”)
-    // uncomment if you want reroute each move:
-    // try { await rerouteNow(newFrom, activeTo); } catch {}
+
   }
 
   const navActive = !!(activeFrom && activeTo && navResult);

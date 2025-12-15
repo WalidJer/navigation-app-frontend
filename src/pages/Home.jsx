@@ -73,7 +73,7 @@ export default function Home() {
     return { text: "Location permission unknown", bg: "#f3f3f3", fg: "#111" };
   })();
 
-  const canStart = backend === "ok"; // we can still navigate, but it's nicer to require backend ok
+  const canStart = backend === "ok"; 
 
   return (
     <div style={{ maxWidth: 900 }}>

@@ -48,7 +48,7 @@ export default function Layout({ children }) {
             Navigate
           </NavLink>
 
-          {/* Dev / Debug link (intentionally subtle) */}
+         
           <Link
             to="/debug"
             style={{
