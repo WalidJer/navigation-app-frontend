@@ -56,8 +56,14 @@ export default function Navigate() {
 
   const [activeFrom, setActiveFrom] = useState(null);
   const [activeTo, setActiveTo] = useState(null);
-  const [routeCoords, setRouteCoords] = useState([]);
+  const [routeCoords, setRouteCoords] = useState([]); // Leaflet coords: [lat,lng]
 
+  // Demo Mode
+  const [demoMode, setDemoMode] = useState(true);
+  const [demoStep, setDemoStep] = useState(5); // how many points to jump per click
+  const demoIndexRef = useRef(0);
+
+  // geolocation watch
   const watchIdRef = useRef(null);
   const lastMetricsAtRef = useRef(0);
 
@@ -128,9 +134,12 @@ export default function Navigate() {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+
     lastMetricsAtRef.current = 0;
     lastRerouteAtRef.current = 0;
     lastRerouteFromRef.current = null;
+
+    demoIndexRef.current = 0;
 
     setNavError("");
     setNavResult(null);
@@ -143,10 +152,32 @@ export default function Navigate() {
     const coords = routeGeometry?.coordinates || [];
     // GeoJSON: [lng,lat] -> Leaflet: [lat,lng]
     setRouteCoords(coords.map(([lng, lat]) => [lat, lng]));
+    demoIndexRef.current = 0;
+  }
+
+  async function updateLiveMetrics(from, to) {
+    const metrics = await navigationApi.navMetrics({
+      from,
+      to,
+      speedMps: Number(speedMps),
+    });
+
+    setNavResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            live: {
+              remainingMeters: metrics.remainingMeters,
+              remainingKm: metrics.remainingKm,
+              etaSeconds: metrics.etaSeconds,
+              etaMinutes: metrics.etaMinutes,
+            },
+          }
+        : prev
+    );
   }
 
   async function rerouteNow(from, to) {
-    // call /api/route to refresh geometry + distance/duration
     const route = await navigationApi.route({ from, to });
 
     setNavResult((prev) =>
@@ -177,18 +208,25 @@ export default function Navigate() {
 
     setSubmitting(true);
     try {
-      const from = await getCurrentLocation();
+      // 1) choose starting "from"
+      const from = demoMode
+        ? // Nice default start for demo if browser location is unavailable:
+          (await getCurrentLocation().catch(() => ({
+            lat: 47.5615,
+            lng: -52.7126,
+          })))
+        : await getCurrentLocation();
+
       if (!from || !isValidCoord(from.lat) || !isValidCoord(from.lng)) {
         throw new Error("Invalid current location.");
       }
 
-      const payload = {
+      // 2) call /api/navigate
+      const result = await navigationApi.navigate({
         address: trimmed,
         from,
         speedMps: Number(speedMps),
-      };
-
-      const result = await navigationApi.navigate(payload);
+      });
 
       setNavResult(result);
 
@@ -204,72 +242,56 @@ export default function Navigate() {
       lastRerouteAtRef.current = Date.now();
       lastRerouteFromRef.current = from;
 
-      // stop old watch if exists
-      if (watchIdRef.current != null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
+      // 3) if not demo mode, start watchPosition
+      if (!demoMode) {
+        if (watchIdRef.current != null) {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+        }
+
+        watchIdRef.current = navigator.geolocation.watchPosition(
+          async (pos) => {
+            const newFrom = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            setActiveFrom(newFrom);
+
+            // throttle metrics calls
+            const now = Date.now();
+            if (now - lastMetricsAtRef.current >= 2000) {
+              lastMetricsAtRef.current = now;
+              try {
+                await updateLiveMetrics(newFrom, to);
+              } catch {
+                // ignore metrics errors
+              }
+            }
+
+            // optional auto reroute
+            const lastFrom = lastRerouteFromRef.current;
+            const moved = lastFrom ? haversineMeters(lastFrom, newFrom) : 0;
+            const timeSince = now - lastRerouteAtRef.current;
+
+            const MOVED_THRESHOLD_METERS = 30;
+            const MIN_REROUTE_INTERVAL_MS = 10000;
+
+            if (moved >= MOVED_THRESHOLD_METERS && timeSince >= MIN_REROUTE_INTERVAL_MS) {
+              try {
+                await rerouteNow(newFrom, to);
+                lastRerouteAtRef.current = now;
+                lastRerouteFromRef.current = newFrom;
+              } catch {
+                //
+              }
+            }
+          },
+          () => {},
+          { enableHighAccuracy: true, maximumAge: 1000 }
+        );
+      } else {
+        // Demo Mode: make sure no watch is running
+        if (watchIdRef.current != null) {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+          watchIdRef.current = null;
+        }
       }
-
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        async (pos) => {
-          const newFrom = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-          setActiveFrom(newFrom);
-
-          // throttle metrics calls (every ~2s)
-          const now = Date.now();
-          if (now - lastMetricsAtRef.current >= 2000) {
-            lastMetricsAtRef.current = now;
-
-            try {
-              const metrics = await navigationApi.navMetrics({
-                from: newFrom,
-                to,
-                speedMps: Number(speedMps),
-              });
-
-              setNavResult((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      live: {
-                        remainingMeters: metrics.remainingMeters,
-                        remainingKm: metrics.remainingKm,
-                        etaSeconds: metrics.etaSeconds,
-                        etaMinutes: metrics.etaMinutes,
-                      },
-                    }
-                  : prev
-              );
-            } catch {
-              // ignore metrics errors during movement
-            }
-          }
-
-          // auto reroute when moved enough + time passed
-          const lastFrom = lastRerouteFromRef.current;
-          const moved =
-            lastFrom && isValidCoord(lastFrom.lat) && isValidCoord(lastFrom.lng)
-              ? haversineMeters(lastFrom, newFrom)
-              : 0;
-
-          const timeSince = now - lastRerouteAtRef.current;
-
-          // tweak these thresholds if you want
-          const MOVED_THRESHOLD_METERS = 30; // reroute if moved 30m+
-          const MIN_REROUTE_INTERVAL_MS = 10000; // at most every 10s
-
-          if (moved >= MOVED_THRESHOLD_METERS && timeSince >= MIN_REROUTE_INTERVAL_MS) {
-            try {
-              await rerouteNow(newFrom, to);
-              lastRerouteAtRef.current = now;
-              lastRerouteFromRef.current = newFrom;
-            } catch {
-              // ignore reroute errors
-            }
-          }
-        },
-        () => {},
-        { enableHighAccuracy: true, maximumAge: 1000 }
-      );
 
       await loadHistory();
     } catch (e2) {
@@ -279,12 +301,95 @@ export default function Navigate() {
     }
   }
 
+  // Demo: move along route line by jumping forward N points
+  async function simulateMove() {
+    if (!demoMode) return;
+    if (!navResult || !activeTo) return;
+    if (!routeCoords || routeCoords.length < 2) return;
+
+    // current index -> next index
+    const currentIndex = demoIndexRef.current;
+    const nextIndex = Math.min(currentIndex + Number(demoStep), routeCoords.length - 1);
+    demoIndexRef.current = nextIndex;
+
+    const [lat, lng] = routeCoords[nextIndex];
+    const newFrom = { lat, lng };
+
+    setActiveFrom(newFrom);
+
+    // update metrics immediately (no throttle needed)
+    try {
+      await updateLiveMetrics(newFrom, activeTo);
+    } catch {
+      //
+    }
+
+    // optional: reroute sometimes (keeps geometry “fresh”)
+    // uncomment if you want reroute each move:
+    // try { await rerouteNow(newFrom, activeTo); } catch {}
+  }
+
   const navActive = !!(activeFrom && activeTo && navResult);
 
   return (
     <div>
       <h3>Destination Entry</h3>
       <p>Enter a destination address and start navigation.</p>
+
+      {/* Demo Mode controls */}
+      <div
+        style={{
+          marginTop: 10,
+          padding: 12,
+          borderRadius: 10,
+          border: "1px solid #eee",
+          background: "#fafafa",
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <label style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={demoMode}
+            onChange={(e) => setDemoMode(e.target.checked)}
+          />
+          <strong>Demo Mode</strong>
+        </label>
+
+        <span style={{ fontSize: 12, opacity: 0.75 }}>
+          Simulate movement along the route (great for laptop demos).
+        </span>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+          <label style={{ fontSize: 12, opacity: 0.8 }}>Step:</label>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            value={demoStep}
+            onChange={(e) => setDemoStep(e.target.value)}
+            style={{ width: 80, padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+            disabled={!demoMode}
+          />
+          <button
+            type="button"
+            onClick={simulateMove}
+            disabled={!demoMode || !navActive}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: demoMode && navActive ? "#fff" : "#f3f3f3",
+              cursor: demoMode && navActive ? "pointer" : "not-allowed",
+            }}
+          >
+            Simulate Move
+          </button>
+        </div>
+      </div>
 
       <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, margin: "16px 0" }}>
         <div style={{ display: "flex", gap: 8 }}>
@@ -366,13 +471,9 @@ export default function Navigate() {
           <h4 style={{ marginTop: 0 }}>Navigation Summary</h4>
 
           <div style={{ marginBottom: 10 }}>
-            <div style={{ fontWeight: 700 }}>
-              Destination: {navResult.destination?.address}
-            </div>
+            <div style={{ fontWeight: 700 }}>Destination: {navResult.destination?.address}</div>
             {navResult.destination?.displayName && (
-              <div style={{ fontSize: 12, opacity: 0.8 }}>
-                {navResult.destination.displayName}
-              </div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>{navResult.destination.displayName}</div>
             )}
             <div style={{ fontSize: 12, opacity: 0.75 }}>
               Cached: {navResult.destination?.cached ? "true" : "false"}
@@ -395,7 +496,6 @@ export default function Navigate() {
             </div>
           </div>
 
-          {/* ✅ Map */}
           {activeFrom && activeTo && (
             <div style={{ marginTop: 14 }}>
               <h4 style={{ margin: "10px 0" }}>Map</h4>
